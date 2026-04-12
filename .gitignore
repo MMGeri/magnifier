@@ -1,0 +1,32 @@
+# Build output
+x64/
+cmake-build-*/
+build/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+ipch/
+*.ipch
+*.ilk
+*.exp
+*.lib
+
+# VS Code
+.vscode/
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# Compiled output
+*.obj
+*.pdb
+*.log
+*.tlog

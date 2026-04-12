@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (${{ matrix.configuration }})
+        run: msbuild magnifier.vcxproj /p:Configuration=${{ matrix.configuration }} /p:Platform=x64
