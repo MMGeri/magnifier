@@ -34,22 +34,17 @@ jobs:
       - name: Build (Release x64)
         run: msbuild magnifier.vcxproj /p:Configuration=Release /p:Platform=x64
 
-      - name: Package
+      - name: Stage binary
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}"
-          $name = "magnifier-$version-win-x64"
-          New-Item -ItemType Directory -Path "dist/$name" | Out-Null
-          Copy-Item x64/Release/magnifier.exe "dist/$name/"
-          Copy-Item README.md "dist/$name/"
-          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
-          Copy-Item x64/Release/magnifier.exe "dist/magnifier-$version-win-x64.exe"
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item x64/Release/magnifier.exe "dist/magnifier-${{ github.ref_name }}-win-x64.exe"
 
       - name: Generate checksums
         shell: pwsh
         working-directory: dist
         run: |
-          Get-ChildItem -File | Where-Object { $_.Extension -in '.zip', '.exe' } |
+          Get-ChildItem -File -Filter *.exe |
             ForEach-Object {
               $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
               "$hash  $($_.Name)"
@@ -59,15 +54,12 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: |
-            dist/*.zip
-            dist/*.exe
+          subject-path: dist/*.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.zip
             dist/*.exe
             dist/SHA256SUMS.txt
           generate_release_notes: true
@@ -77,11 +69,11 @@ jobs:
 
             Checksum (PowerShell):
             ```powershell
-            Get-FileHash .\magnifier-${{ github.ref_name }}-win-x64.zip -Algorithm SHA256
+            Get-FileHash .\magnifier-${{ github.ref_name }}-win-x64.exe -Algorithm SHA256
             ```
             Compare with `SHA256SUMS.txt` attached to this release.
 
             Build provenance (proves the binary was built by this repository's workflow from this exact commit):
             ```
-            gh attestation verify magnifier-${{ github.ref_name }}-win-x64.zip --repo ${{ github.repository }}
+            gh attestation verify magnifier-${{ github.ref_name }}-win-x64.exe --repo ${{ github.repository }}
             ```

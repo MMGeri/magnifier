@@ -123,16 +123,15 @@ git push origin v1.2.3
 - `major` — breaking changes or major rewrites
 
 Each release contains:
-- `magnifier-vX.Y.Z-win-x64.zip` — the executable plus README
-- `magnifier-vX.Y.Z-win-x64.exe` — the bare executable
+- `magnifier-vX.Y.Z-win-x64.exe` — the executable
 - `SHA256SUMS.txt` — SHA-256 checksums of the files above
 - a signed build provenance attestation (GitHub artifact attestation)
 
 ### Verifying a download
 
 ```powershell
-Get-FileHash .\magnifier-v1.2.3-win-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
-gh attestation verify magnifier-v1.2.3-win-x64.zip --repo MMGeri/magnifier
+Get-FileHash .\magnifier-v1.2.3-win-x64.exe -Algorithm SHA256   # compare with SHA256SUMS.txt
+gh attestation verify magnifier-v1.2.3-win-x64.exe --repo MMGeri/magnifier
 ```
 
 The attestation proves the file was built by this repository's release workflow from the tagged commit.
@@ -140,4 +139,4 @@ The attestation proves the file was built by this repository's release workflow 
 ## CI
 
 - **Every PR** — builds Debug and Release (x64) to catch build failures before merge
-- **Tag push** (`v*.*.*`) — verifies the tag is on `main`, builds Release, then publishes a GitHub Release with the zip, exe, checksums and build provenance attestation
+- **Tag push** (`v*.*.*`) — verifies the tag is on `main`, builds Release, then publishes a GitHub Release with the exe, checksums and build provenance attestation
