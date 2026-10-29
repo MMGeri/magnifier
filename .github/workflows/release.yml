@@ -5,24 +5,83 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign build provenance
+  attestations: write   # store build provenance
+
 jobs:
-  build:
+  release:
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main
+        shell: bash
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not on main. Release from a commit that has been merged."
+            exit 1
+          fi
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build
+      - name: Build (Release x64)
         run: msbuild magnifier.vcxproj /p:Configuration=Release /p:Platform=x64
 
-      - name: Stage artifact
-        run: cp x64\Release\magnifier.exe magnifier.exe
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $name = "magnifier-$version-win-x64"
+          New-Item -ItemType Directory -Path "dist/$name" | Out-Null
+          Copy-Item x64/Release/magnifier.exe "dist/$name/"
+          Copy-Item README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          Copy-Item x64/Release/magnifier.exe "dist/magnifier-$version-win-x64.exe"
+
+      - name: Generate checksums
+        shell: pwsh
+        working-directory: dist
+        run: |
+          Get-ChildItem -File | Where-Object { $_.Extension -in '.zip', '.exe' } |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$hash  $($_.Name)"
+            } | Out-File -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.exe
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: magnifier.exe
+          files: |
+            dist/*.zip
+            dist/*.exe
+            dist/SHA256SUMS.txt
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Verify this download
+
+            Checksum (PowerShell):
+            ```powershell
+            Get-FileHash .\magnifier-${{ github.ref_name }}-win-x64.zip -Algorithm SHA256
+            ```
+            Compare with `SHA256SUMS.txt` attached to this release.
+
+            Build provenance (proves the binary was built by this repository's workflow from this exact commit):
+            ```
+            gh attestation verify magnifier-${{ github.ref_name }}-win-x64.zip --repo ${{ github.repository }}
+            ```

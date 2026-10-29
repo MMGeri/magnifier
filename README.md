@@ -110,7 +110,7 @@ The built executable prints a message and exits (stub build).
 
 ## Release Process
 
-Releases are triggered by pushing a version tag. GitHub Actions builds the Release binary and publishes it as a GitHub Release with auto-generated notes.
+Releases are triggered by pushing a version tag on a commit that is on `main`. GitHub Actions builds the Release binary, packages it, and publishes a GitHub Release with auto-generated notes.
 
 ```bash
 git tag v1.2.3
@@ -122,9 +122,22 @@ git push origin v1.2.3
 - `minor` — new features (backwards compatible)
 - `major` — breaking changes or major rewrites
 
-The release artifact is attached as `magnifier.exe`.
+Each release contains:
+- `magnifier-vX.Y.Z-win-x64.zip` — the executable plus README
+- `magnifier-vX.Y.Z-win-x64.exe` — the bare executable
+- `SHA256SUMS.txt` — SHA-256 checksums of the files above
+- a signed build provenance attestation (GitHub artifact attestation)
+
+### Verifying a download
+
+```powershell
+Get-FileHash .\magnifier-v1.2.3-win-x64.zip -Algorithm SHA256   # compare with SHA256SUMS.txt
+gh attestation verify magnifier-v1.2.3-win-x64.zip --repo MMGeri/magnifier
+```
+
+The attestation proves the file was built by this repository's release workflow from the tagged commit.
 
 ## CI
 
 - **Every PR** — builds Debug and Release (x64) to catch build failures before merge
-- **Tag push** (`v*.*.*`) — builds Release, creates GitHub Release with the binary attached
+- **Tag push** (`v*.*.*`) — verifies the tag is on `main`, builds Release, then publishes a GitHub Release with the zip, exe, checksums and build provenance attestation
