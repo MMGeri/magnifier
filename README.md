@@ -31,6 +31,13 @@ A Windows screen magnification overlay built on the Windows Magnification API. C
 - Windows SDK (`magnification.h`, `windows.h`, `wincodec.h`) — no third-party libraries
 - Visual Studio 2022 (or 2013+) for building from source
 
+### Linux / macOS note
+
+This application uses the Windows Magnification API and Win32 UI, so it does **not** run on Linux/macOS.
+
+However, the repository is set up to **compile** on non-Windows platforms via CMake using a small stub `main()`.
+This is mainly for cross-platform development tooling and CI.
+
 ## Build
 
 ### Option 1 — Developer Command Prompt / PowerShell for VS 2022
@@ -66,6 +73,13 @@ cmake -B build
 cmake --build build
 ```
 
+On Linux/macOS you can also use:
+
+```bash
+chmod +x ./scripts/build.sh
+./scripts/build.sh
+```
+
 Output: `x64\Debug\magnifier.exe` / `x64\Release\magnifier.exe`
 
 ## Run
@@ -89,6 +103,10 @@ x64\Debug\magnifier.exe
 ```powershell
 x64\Release\magnifier.exe
 ```
+
+### Linux/macOS
+
+The built executable prints a message and exits (stub build).
 
 ## Release Process
 

@@ -3,19 +3,49 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#if defined(_WIN32)
+
 #include <windows.h>
 #include <wincodec.h>
 #include <magnification.h>
 #include <shellapi.h>
+#include <algorithm>
 #include <vector>
 #include <string>
 #include <shlwapi.h>
-#pragma comment(lib, "shlwapi.lib")
 
-static constexpr float DEFAULT_MAGNIFICATION = 3.0f;
-static constexpr double HUNT_OFFSET_RATIO = 0.092592;
-static constexpr UINT EXTENDED_SCAN_CODE_FLAG = 0x100;
-static constexpr UINT MILLISECONDS_PER_SECOND = 1000u;
+#if defined(_MSC_VER)
+#pragma comment(lib, "shlwapi.lib")
+#endif
+
+namespace
+{
+    constexpr float kDefaultMagnification = 3.0f;
+    constexpr double kHuntOffsetRatio = 0.092592;
+    constexpr UINT kExtendedScanCodeFlag = 0x100;
+    constexpr UINT kMillisecondsPerSecond = 1000u;
+
+    constexpr int kMinOverlaySizePx = 50;
+    constexpr int kMinFrameRate = 1;
+    constexpr int kMaxFrameRate = 360;
+    constexpr float kMinMagStep = 0.1f;
+
+    constexpr const WCHAR *kIniSection = L"magnifier";
+} // namespace
+
+template <typename T>
+static T Clamp(T value, T minValue, T maxValue)
+{
+    if (value < minValue)
+        return minValue;
+    if (value > maxValue)
+        return maxValue;
+    return value;
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -27,7 +57,7 @@ struct Config
     float magStep = 1.0f;
     int frameRate = 60;
     int offsetY = 0;
-    bool offsetIsHunt = true;
+    int offsetPreset = 1; // Center
     int monitorIndex = 0;
     int windowWidth = 400;
     int windowHeight = 400;
@@ -35,16 +65,90 @@ struct Config
 
 static Config g_config;
 
-static void GetIniPath(WCHAR *buf, DWORD len)
+static void BuildSettingsIniPath(WCHAR *buf, DWORD len)
 {
     GetModuleFileNameW(NULL, buf, len);
     PathRemoveFileSpecW(buf);
     PathAppendW(buf, L"settings.ini");
 }
 
-static int HuntOffset()
+static int ComputeHuntOffsetPx()
 {
-    return int(GetSystemMetrics(SM_CYSCREEN) * HUNT_OFFSET_RATIO);
+    return int(GetSystemMetrics(SM_CYSCREEN) * kHuntOffsetRatio);
+}
+
+static int ComputeCenterOffsetPx()
+{
+    return 0;
+}
+
+enum class OffsetPresetId : int
+{
+    Custom = 0,
+    Center = 1,
+    HuntShowdown = 2,
+};
+
+struct OffsetPresetDef
+{
+    OffsetPresetId id;
+    const WCHAR *label;
+    bool locksValue;
+    int (*computeValuePx)();
+};
+
+static constexpr OffsetPresetDef kOffsetPresets[] = {
+    {OffsetPresetId::Custom, L"Custom", false, nullptr},
+    {OffsetPresetId::Center, L"Center", true, &ComputeCenterOffsetPx},
+    {OffsetPresetId::HuntShowdown, L"Hunt: Showdown", true, &ComputeHuntOffsetPx},
+};
+
+static const OffsetPresetDef &GetOffsetPresetDefById(OffsetPresetId id)
+{
+    for (const auto &preset : kOffsetPresets)
+    {
+        if (preset.id == id)
+            return preset;
+    }
+    return kOffsetPresets[1];
+}
+
+static int GetOffsetPresetComboIndex(OffsetPresetId id)
+{
+    for (int i = 0; i < (int)(sizeof(kOffsetPresets) / sizeof(kOffsetPresets[0])); i++)
+    {
+        if (kOffsetPresets[i].id == id)
+            return i;
+    }
+    return 1;
+}
+
+static OffsetPresetId GetOffsetPresetIdFromComboIndex(int index)
+{
+    if (index >= 0 && index < (int)(sizeof(kOffsetPresets) / sizeof(kOffsetPresets[0])))
+        return kOffsetPresets[index].id;
+    return OffsetPresetId::Center;
+}
+
+static OffsetPresetId ClampOffsetPresetId(int rawValue)
+{
+    switch ((OffsetPresetId)rawValue)
+    {
+    case OffsetPresetId::Custom:
+    case OffsetPresetId::Center:
+    case OffsetPresetId::HuntShowdown:
+        return (OffsetPresetId)rawValue;
+    default:
+        return OffsetPresetId::Center;
+    }
+}
+
+static int ComputeOffsetPxForPreset(OffsetPresetId preset)
+{
+    const auto &def = GetOffsetPresetDefById(preset);
+    if (def.computeValuePx)
+        return def.computeValuePx();
+    return 0;
 }
 
 static std::wstring KeyName(DWORD vk)
@@ -53,7 +157,7 @@ static std::wstring KeyName(DWORD vk)
     if (vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT ||
         vk == VK_INSERT || vk == VK_DELETE || vk == VK_HOME || vk == VK_END ||
         vk == VK_PRIOR || vk == VK_NEXT || vk == VK_NUMLOCK)
-        sc |= EXTENDED_SCAN_CODE_FLAG;
+        sc |= kExtendedScanCodeFlag;
     WCHAR buf[64] = {};
     GetKeyNameTextW((LONG)(sc << 16), buf, 64);
     if (buf[0])
@@ -66,11 +170,11 @@ static std::wstring KeyName(DWORD vk)
 static void LoadConfig()
 {
     WCHAR path[MAX_PATH];
-    GetIniPath(path, MAX_PATH);
+    BuildSettingsIniPath(path, MAX_PATH);
 
     auto getInt = [&](const WCHAR *key, int def)
     {
-        return (int)GetPrivateProfileIntW(L"magnifier", key, def, path);
+        return (int)GetPrivateProfileIntW(kIniSection, key, def, path);
     };
 
     g_config.toggleKey = getInt(L"toggleKey", 0x59);
@@ -79,35 +183,36 @@ static void LoadConfig()
     g_config.monitorIndex = getInt(L"monitorIndex", 0);
     g_config.windowWidth = getInt(L"windowWidth", 400);
     g_config.windowHeight = getInt(L"windowHeight", 400);
-    g_config.offsetIsHunt = getInt(L"offsetIsHunt", 1) != 0;
+    g_config.offsetPreset = (int)OffsetPresetId::Center;
 
-    g_config.frameRate = getInt(L"frameRate", 60);
-    if (g_config.frameRate < 1)
-        g_config.frameRate = 1;
-    if (g_config.frameRate > 360)
-        g_config.frameRate = 360;
+    g_config.frameRate = Clamp(getInt(L"frameRate", 60), kMinFrameRate, kMaxFrameRate);
 
     WCHAR stepText[32];
-    GetPrivateProfileStringW(L"magnifier", L"magStep", L"1.0", stepText, 32, path);
+    GetPrivateProfileStringW(kIniSection, L"magStep", L"1.0", stepText, 32, path);
     g_config.magStep = (float)_wtof(stepText);
-    if (g_config.magStep < 0.1f)
-        g_config.magStep = 0.1f;
+    if (g_config.magStep < kMinMagStep)
+        g_config.magStep = kMinMagStep;
 
-    g_config.offsetY = g_config.offsetIsHunt
-                           ? HuntOffset()
-                           : getInt(L"offsetY", HuntOffset());
+    g_config.offsetPreset = getInt(L"offsetPreset", (int)OffsetPresetId::Center);
+    g_config.offsetPreset = (int)ClampOffsetPresetId(g_config.offsetPreset);
+
+    OffsetPresetId preset = (OffsetPresetId)g_config.offsetPreset;
+    if (preset == OffsetPresetId::Custom)
+        g_config.offsetY = getInt(L"offsetY", 0);
+    else
+        g_config.offsetY = ComputeOffsetPxForPreset(preset);
 }
 
 static void SaveConfig()
 {
     WCHAR path[MAX_PATH];
-    GetIniPath(path, MAX_PATH);
+    BuildSettingsIniPath(path, MAX_PATH);
 
     auto writeInt = [&](const WCHAR *key, int val)
     {
         WCHAR text[32];
         swprintf_s(text, L"%d", val);
-        WritePrivateProfileStringW(L"magnifier", key, text, path);
+        WritePrivateProfileStringW(kIniSection, key, text, path);
     };
 
     writeInt(L"toggleKey", (int)g_config.toggleKey);
@@ -116,13 +221,13 @@ static void SaveConfig()
     writeInt(L"monitorIndex", g_config.monitorIndex);
     writeInt(L"windowWidth", g_config.windowWidth);
     writeInt(L"windowHeight", g_config.windowHeight);
-    writeInt(L"offsetIsHunt", g_config.offsetIsHunt ? 1 : 0);
+    writeInt(L"offsetPreset", g_config.offsetPreset);
     writeInt(L"offsetY", g_config.offsetY);
     writeInt(L"frameRate", g_config.frameRate);
 
     WCHAR stepText[32];
     swprintf_s(stepText, L"%.2f", g_config.magStep);
-    WritePrivateProfileStringW(L"magnifier", L"magStep", stepText, path);
+    WritePrivateProfileStringW(kIniSection, L"magStep", stepText, path);
 }
 
 // ─── Monitor enumeration ─────────────────────────────────────────────────────
@@ -158,23 +263,32 @@ static RECT GetMonitorRect(int idx)
     return r;
 }
 
+static POINT GetMonitorCenter(int idx)
+{
+    RECT mr = GetMonitorRect(idx);
+    return {
+        mr.left + (mr.right - mr.left) / 2,
+        mr.top + (mr.bottom - mr.top) / 2,
+    };
+}
+
 // ─── Magnifier globals ───────────────────────────────────────────────────────
 
-float g_magFactor = DEFAULT_MAGNIFICATION;
-HINSTANCE hInst;
-const WCHAR WindowClassName[] = L"MagnifierWindow";
-HWND hwndMag;
-HWND hwndHost;
-RECT magWindowRect;
-bool g_overlayVisible = false;
+static float g_magFactor = kDefaultMagnification;
+static HINSTANCE g_hInstance = NULL;
+static constexpr WCHAR kHostWindowClassName[] = L"MagnifierWindow";
+static HWND g_hwndMag = NULL;
+static HWND g_hwndHost = NULL;
+static RECT g_magWindowRect = {};
+static bool g_overlayVisible = false;
 
 static UINT_PTR g_timerId = 0;
 
 static UINT TimerInterval()
 {
-    UINT fps = (UINT)max(1, g_config.frameRate);
-    UINT ms = MILLISECONDS_PER_SECOND / fps;
-    return max(1u, ms);
+    UINT fps = (UINT)Clamp(g_config.frameRate, kMinFrameRate, kMaxFrameRate);
+    UINT ms = kMillisecondsPerSecond / fps;
+    return std::max(1u, ms);
 }
 
 // ─── Forward declarations ────────────────────────────────────────────────────
@@ -186,11 +300,25 @@ void CALLBACK UpdateMagWindow(HWND, UINT, UINT_PTR, DWORD);
 LRESULT CALLBACK LowLevelKeyboardProc(int, WPARAM, LPARAM);
 void OpenSettingsWindow();
 
+static void RestartUpdateTimer()
+{
+    KillTimer(g_hwndHost, g_timerId);
+    g_timerId = SetTimer(g_hwndHost, 0, TimerInterval(), UpdateMagWindow);
+}
+
+static BOOL ApplyMagnificationTransform()
+{
+    MAGTRANSFORM m = {};
+    m.v[0][0] = m.v[1][1] = g_magFactor;
+    m.v[2][2] = 1.0f;
+    return MagSetWindowTransform(g_hwndMag, &m);
+}
+
 // ─── Tray ────────────────────────────────────────────────────────────────────
 
-#define WM_TRAY (WM_APP + 1)
-#define ID_TRAY_SETTINGS 1001
-#define ID_TRAY_EXIT 1002
+static constexpr UINT WM_TRAY = WM_APP + 1;
+static constexpr UINT ID_TRAY_SETTINGS = 1001;
+static constexpr UINT ID_TRAY_EXIT = 1002;
 
 static NOTIFYICONDATAW g_nid = {};
 
@@ -215,36 +343,34 @@ static void RemoveTray()
 
 static void ApplyOverlay()
 {
-    RECT mr = GetMonitorRect(g_config.monitorIndex);
-    int cx = mr.left + (mr.right - mr.left) / 2;
-    int cy = mr.top + (mr.bottom - mr.top) / 2;
-    SetWindowPos(hwndHost, HWND_TOPMOST,
-                 cx - g_config.windowWidth / 2,
-                 cy + g_config.offsetY - g_config.windowHeight / 2,
+    POINT center = GetMonitorCenter(g_config.monitorIndex);
+    SetWindowPos(g_hwndHost, HWND_TOPMOST,
+                 center.x - g_config.windowWidth / 2,
+                 center.y + g_config.offsetY - g_config.windowHeight / 2,
                  g_config.windowWidth, g_config.windowHeight,
                  SWP_NOACTIVATE);
-    GetClientRect(hwndHost, &magWindowRect);
-    SetWindowPos(hwndMag, NULL,
-                 magWindowRect.left, magWindowRect.top,
-                 magWindowRect.right, magWindowRect.bottom, 0);
+    GetClientRect(g_hwndHost, &g_magWindowRect);
+    SetWindowPos(g_hwndMag, NULL,
+                 g_magWindowRect.left, g_magWindowRect.top,
+                 g_magWindowRect.right, g_magWindowRect.bottom, 0);
 }
 
 // ─── Settings window ─────────────────────────────────────────────────────────
 
 static HWND g_hwndSettings = NULL;
 
-#define ID_EDT_TOGGLE 2001
-#define ID_EDT_MAGUP 2002
-#define ID_EDT_MAGDOWN 2003
-#define ID_EDT_STEP 2004
-#define ID_EDT_WIDTH 2005
-#define ID_EDT_HEIGHT 2006
-#define ID_CMB_MONITOR 2007
-#define ID_CMB_PRESET 2008
-#define ID_EDT_OFFSET 2009
-#define ID_BTN_CLOSE 2010
-#define ID_BTN_EXIT 2011
-#define ID_EDT_FPS 2012
+static constexpr int ID_EDT_TOGGLE = 2001;
+static constexpr int ID_EDT_MAGUP = 2002;
+static constexpr int ID_EDT_MAGDOWN = 2003;
+static constexpr int ID_EDT_STEP = 2004;
+static constexpr int ID_EDT_WIDTH = 2005;
+static constexpr int ID_EDT_HEIGHT = 2006;
+static constexpr int ID_CMB_MONITOR = 2007;
+static constexpr int ID_CMB_PRESET = 2008;
+static constexpr int ID_EDT_OFFSET = 2009;
+static constexpr int ID_BTN_CLOSE = 2010;
+static constexpr int ID_BTN_EXIT = 2011;
+static constexpr int ID_EDT_FPS = 2012;
 
 struct KeyCapture
 {
@@ -256,15 +382,19 @@ struct KeyCapture
 };
 static KeyCapture g_keyCaptures[3];
 
+static KeyCapture *FindKeyCapture(HWND hwnd)
+{
+    for (auto &capture : g_keyCaptures)
+    {
+        if (capture.hwnd == hwnd)
+            return &capture;
+    }
+    return nullptr;
+}
+
 static LRESULT CALLBACK KeyEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    KeyCapture *capture = nullptr;
-    for (auto &k : g_keyCaptures)
-        if (k.hwnd == hwnd)
-        {
-            capture = &k;
-            break;
-        }
+    KeyCapture *capture = FindKeyCapture(hwnd);
     if (!capture)
         return DefWindowProcW(hwnd, msg, wParam, lParam);
 
@@ -299,6 +429,31 @@ static LRESULT CALLBACK KeyEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return CallWindowProcW(capture->origProc, hwnd, msg, wParam, lParam);
 }
 
+static void SyncOffsetControlsFromPreset(HWND hwnd)
+{
+    HWND presetCombo = GetDlgItem(hwnd, ID_CMB_PRESET);
+    HWND offsetEdit = GetDlgItem(hwnd, ID_EDT_OFFSET);
+    if (!presetCombo || !offsetEdit)
+        return;
+
+    int sel = (int)SendMessageW(presetCombo, CB_GETCURSEL, 0, 0);
+    OffsetPresetId preset = GetOffsetPresetIdFromComboIndex(sel);
+    const auto &def = GetOffsetPresetDefById(preset);
+
+    if (def.locksValue)
+    {
+        int px = ComputeOffsetPxForPreset(preset);
+        WCHAR text[16];
+        swprintf_s(text, L"%d", px);
+        SetWindowTextW(offsetEdit, text);
+        EnableWindow(offsetEdit, FALSE);
+    }
+    else
+    {
+        EnableWindow(offsetEdit, TRUE);
+    }
+}
+
 // Read all settings controls, apply live, and save.
 // Guard: only run after all controls have been created.
 static void ApplyFromControls(HWND hwnd)
@@ -315,27 +470,26 @@ static void ApplyFromControls(HWND hwnd)
     // step
     GetWindowTextW(GetDlgItem(hwnd, ID_EDT_STEP), text, 32);
     float step = (float)_wtof(text);
-    if (step >= 0.1f)
+    if (step >= kMinMagStep)
         g_config.magStep = step;
 
     // frame rate — restart timer if changed
     GetWindowTextW(GetDlgItem(hwnd, ID_EDT_FPS), text, 32);
     int fps = _wtoi(text);
-    if (fps >= 1 && fps <= 360 && fps != g_config.frameRate)
+    if (fps >= kMinFrameRate && fps <= kMaxFrameRate && fps != g_config.frameRate)
     {
         g_config.frameRate = fps;
-        KillTimer(hwndHost, g_timerId);
-        g_timerId = SetTimer(hwndHost, 0, TimerInterval(), UpdateMagWindow);
+        RestartUpdateTimer();
     }
 
     // size
     GetWindowTextW(GetDlgItem(hwnd, ID_EDT_WIDTH), text, 32);
     int width = _wtoi(text);
-    if (width >= 50)
+    if (width >= kMinOverlaySizePx)
         g_config.windowWidth = width;
     GetWindowTextW(GetDlgItem(hwnd, ID_EDT_HEIGHT), text, 32);
     int height = _wtoi(text);
-    if (height >= 50)
+    if (height >= kMinOverlaySizePx)
         g_config.windowHeight = height;
 
     // monitor
@@ -345,15 +499,16 @@ static void ApplyFromControls(HWND hwnd)
 
     // offset
     int presetSelection = (int)SendMessageW(GetDlgItem(hwnd, ID_CMB_PRESET), CB_GETCURSEL, 0, 0);
-    g_config.offsetIsHunt = (presetSelection == 1);
-    if (g_config.offsetIsHunt)
-    {
-        g_config.offsetY = HuntOffset();
-    }
-    else
+    OffsetPresetId preset = GetOffsetPresetIdFromComboIndex(presetSelection);
+    g_config.offsetPreset = (int)preset;
+    if (preset == OffsetPresetId::Custom)
     {
         GetWindowTextW(GetDlgItem(hwnd, ID_EDT_OFFSET), text, 32);
         g_config.offsetY = _wtoi(text);
+    }
+    else
+    {
+        g_config.offsetY = ComputeOffsetPxForPreset(preset);
     }
 
     // Keys are updated immediately in KeyEditProc — don't touch them here.
@@ -378,21 +533,24 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
         if (id == ID_CMB_PRESET && notif == CBN_SELCHANGE)
         {
-            int sel = (int)SendMessageW(GetDlgItem(hwnd, ID_CMB_PRESET), CB_GETCURSEL, 0, 0);
-            HWND offsetEdit = GetDlgItem(hwnd, ID_EDT_OFFSET);
-            if (sel == 1)
-            {
-                WCHAR text[16];
-                swprintf_s(text, L"%d", HuntOffset());
-                SetWindowTextW(offsetEdit, text);
-                EnableWindow(offsetEdit, FALSE);
-            }
-            else
-            {
-                EnableWindow(offsetEdit, TRUE);
-            }
+            SyncOffsetControlsFromPreset(hwnd);
             ApplyFromControls(hwnd);
         }
+
+        auto isValidNumericEdit = [&](int controlId, const WCHAR *text) -> bool
+        {
+            double v = _wtof(text);
+            if (controlId == ID_EDT_STEP)
+                return v >= kMinMagStep;
+            if (controlId == ID_EDT_WIDTH)
+                return v >= kMinOverlaySizePx;
+            if (controlId == ID_EDT_HEIGHT)
+                return v >= kMinOverlaySizePx;
+            if (controlId == ID_EDT_FPS)
+                return (v >= kMinFrameRate && v <= kMaxFrameRate);
+            // Offset edit: preserve existing behavior (apply when non-empty).
+            return text[0] != L'\0';
+        };
 
         // Numeric edits — apply as you type (EN_CHANGE), only when value is valid.
         if ((id == ID_EDT_STEP || id == ID_EDT_WIDTH || id == ID_EDT_HEIGHT ||
@@ -401,12 +559,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         {
             WCHAR text[32];
             GetWindowTextW((HWND)lParam, text, 32);
-            double v = _wtof(text);
-            bool valid = (id == ID_EDT_STEP) ? v >= 0.1 : (id == ID_EDT_WIDTH) ? v >= 50
-                                                      : (id == ID_EDT_HEIGHT)  ? v >= 50
-                                                      : (id == ID_EDT_FPS)     ? (v >= 1 && v <= 360)
-                                                                               : text[0] != L'\0';
-            if (valid)
+            if (isValidNumericEdit(id, text))
                 ApplyFromControls(hwnd);
         }
 
@@ -418,7 +571,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (id == ID_BTN_EXIT)
         {
             DestroyWindow(hwnd);
-            DestroyWindow(hwndHost);
+            DestroyWindow(g_hwndHost);
         }
         break;
     }
@@ -438,30 +591,30 @@ static HWND MakeGroup(HWND p, const WCHAR *t, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"BUTTON", t,
                            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                           x, y, w, h, p, NULL, hInst, NULL);
+                           x, y, w, h, p, NULL, g_hInstance, NULL);
 }
 static HWND MakeLabel(HWND p, const WCHAR *t, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE | SS_LEFT,
-                           x, y, w, h, p, NULL, hInst, NULL);
+                           x, y, w, h, p, NULL, g_hInstance, NULL);
 }
 static HWND MakeEdit(HWND p, int id, const WCHAR *t, int x, int y, int w, int h)
 {
     return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", t,
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                           x, y, w, h, p, (HMENU)(INT_PTR)id, hInst, NULL);
+                           x, y, w, h, p, (HMENU)(INT_PTR)id, g_hInstance, NULL);
 }
 static HWND MakeCombo(HWND p, int id, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"COMBOBOX", NULL,
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                           x, y, w, h, p, (HMENU)(INT_PTR)id, hInst, NULL);
+                           x, y, w, h, p, (HMENU)(INT_PTR)id, g_hInstance, NULL);
 }
 static HWND MakeButton(HWND p, int id, const WCHAR *t, int x, int y, int w, int h)
 {
     return CreateWindowExW(0, L"BUTTON", t,
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                           x, y, w, h, p, (HMENU)(INT_PTR)id, hInst, NULL);
+                           x, y, w, h, p, (HMENU)(INT_PTR)id, g_hInstance, NULL);
 }
 
 void OpenSettingsWindow()
@@ -478,7 +631,7 @@ void OpenSettingsWindow()
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = SettingsWndProc;
-        wc.hInstance = hInst;
+        wc.hInstance = g_hInstance;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
         wc.lpszClassName = L"MagSettings";
@@ -512,7 +665,7 @@ void OpenSettingsWindow()
                                      L"MagSettings", L"Magnifier Settings",
                                      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                                      CW_USEDEFAULT, CW_USEDEFAULT, DIALOG_WIDTH, totalWindowHeight,
-                                     hwndHost, NULL, hInst, NULL);
+                                     g_hwndHost, NULL, g_hInstance, NULL);
 
     // ── Shortcuts ────────────────────────────────────────────────────────────
     MakeGroup(g_hwndSettings, L"Shortcuts", GROUP_LEFT, y, GROUP_WIDTH, TRIPLE_ROW_GROUP_H);
@@ -585,18 +738,16 @@ void OpenSettingsWindow()
 
     MakeLabel(g_hwndSettings, L"Preset:", LABEL_LEFT, rowY + 3, LABEL_WIDTH, 16);
     HWND presetCombo = MakeCombo(g_hwndSettings, ID_CMB_PRESET, EDIT_LEFT, rowY, EDIT_WIDTH, 100);
-    SendMessageW(presetCombo, CB_ADDSTRING, 0, (LPARAM)L"Custom");
-    SendMessageW(presetCombo, CB_ADDSTRING, 0, (LPARAM)L"Hunt: Showdown");
-    // Todo add center offset, and others in future updatesyy
-    SendMessageW(presetCombo, CB_SETCURSEL, g_config.offsetIsHunt ? 1 : 0, 0);
+    for (const auto &preset : kOffsetPresets)
+        SendMessageW(presetCombo, CB_ADDSTRING, 0, (LPARAM)preset.label);
+    SendMessageW(presetCombo, CB_SETCURSEL, GetOffsetPresetComboIndex((OffsetPresetId)g_config.offsetPreset), 0);
     rowY += ROW_HEIGHT;
 
     MakeLabel(g_hwndSettings, L"Value (px):", LABEL_LEFT, rowY + 3, LABEL_WIDTH, 16);
     WCHAR offsetText[16];
     swprintf_s(offsetText, L"%d", g_config.offsetY);
-    HWND offsetEdit = MakeEdit(g_hwndSettings, ID_EDT_OFFSET, offsetText, EDIT_LEFT, rowY, 60, 20);
-    if (g_config.offsetIsHunt)
-        EnableWindow(offsetEdit, FALSE);
+    MakeEdit(g_hwndSettings, ID_EDT_OFFSET, offsetText, EDIT_LEFT, rowY, 60, 20);
+    SyncOffsetControlsFromPreset(g_hwndSettings);
 
     y += DOUBLE_ROW_GROUP_H + GROUP_GAP;
 
@@ -630,12 +781,12 @@ LRESULT CALLBACK HostWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         break;
 
     case WM_SIZE:
-        if (hwndMag)
+        if (g_hwndMag)
         {
-            GetClientRect(hWnd, &magWindowRect);
-            SetWindowPos(hwndMag, NULL,
-                         magWindowRect.left, magWindowRect.top,
-                         magWindowRect.right, magWindowRect.bottom, 0);
+            GetClientRect(hWnd, &g_magWindowRect);
+            SetWindowPos(g_hwndMag, NULL,
+                         g_magWindowRect.left, g_magWindowRect.top,
+                         g_magWindowRect.right, g_magWindowRect.bottom, 0);
         }
         break;
 
@@ -680,24 +831,18 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         if (vk == g_config.toggleKey)
         {
             g_overlayVisible = !g_overlayVisible;
-            SetLayeredWindowAttributes(hwndHost, 0, g_overlayVisible ? 255 : 0, LWA_ALPHA);
+            SetLayeredWindowAttributes(g_hwndHost, 0, g_overlayVisible ? 255 : 0, LWA_ALPHA);
         }
         if (vk == g_config.magUpKey)
         {
             g_magFactor += g_config.magStep;
-            MAGTRANSFORM m = {};
-            m.v[0][0] = m.v[1][1] = g_magFactor;
-            m.v[2][2] = 1.0f;
-            MagSetWindowTransform(hwndMag, &m);
+            ApplyMagnificationTransform();
         }
         if (vk == g_config.magDownKey)
         {
             if (g_magFactor - g_config.magStep >= 1.0f)
                 g_magFactor -= g_config.magStep;
-            MAGTRANSFORM m = {};
-            m.v[0][0] = m.v[1][1] = g_magFactor;
-            m.v[2][2] = 1.0f;
-            MagSetWindowTransform(hwndMag, &m);
+            ApplyMagnificationTransform();
         }
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
@@ -714,7 +859,7 @@ ATOM RegisterHostWindowClass(HINSTANCE hInstance)
     wcex.hInstance = hInstance;
     wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
     wcex.hbrBackground = (HBRUSH)(1 + COLOR_BTNFACE);
-    wcex.lpszClassName = WindowClassName;
+    wcex.lpszClassName = kHostWindowClassName;
     return RegisterClassExW(&wcex);
 }
 
@@ -722,34 +867,29 @@ BOOL SetupMagnifier(HINSTANCE hinst)
 {
     RegisterHostWindowClass(hinst);
 
-    RECT mr = GetMonitorRect(g_config.monitorIndex);
-    int cx = mr.left + (mr.right - mr.left) / 2;
-    int cy = mr.top + (mr.bottom - mr.top) / 2;
+    POINT center = GetMonitorCenter(g_config.monitorIndex);
 
-    hwndHost = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                               WindowClassName, L"Screen Magnifier", WS_POPUP,
-                               cx - g_config.windowWidth / 2,
-                               cy + g_config.offsetY - g_config.windowHeight / 2,
-                               g_config.windowWidth, g_config.windowHeight,
-                               NULL, NULL, hInst, NULL);
-    if (!hwndHost)
+    g_hwndHost = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                 kHostWindowClassName, L"Screen Magnifier", WS_POPUP,
+                                 center.x - g_config.windowWidth / 2,
+                                 center.y + g_config.offsetY - g_config.windowHeight / 2,
+                                 g_config.windowWidth, g_config.windowHeight,
+                                 NULL, NULL, g_hInstance, NULL);
+    if (!g_hwndHost)
         return FALSE;
 
-    SetLayeredWindowAttributes(hwndHost, 0, 0, LWA_ALPHA);
+    SetLayeredWindowAttributes(g_hwndHost, 0, 0, LWA_ALPHA);
 
-    GetClientRect(hwndHost, &magWindowRect);
-    hwndMag = CreateWindowExW(0, WC_MAGNIFIERW, L"MagnifierWindow",
-                              WS_CHILD | WS_VISIBLE,
-                              magWindowRect.left, magWindowRect.top,
-                              magWindowRect.right, magWindowRect.bottom,
-                              hwndHost, NULL, hInst, NULL);
-    if (!hwndMag)
+    GetClientRect(g_hwndHost, &g_magWindowRect);
+    g_hwndMag = CreateWindowExW(0, WC_MAGNIFIERW, L"MagnifierWindow",
+                                WS_CHILD | WS_VISIBLE,
+                                g_magWindowRect.left, g_magWindowRect.top,
+                                g_magWindowRect.right, g_magWindowRect.bottom,
+                                g_hwndHost, NULL, g_hInstance, NULL);
+    if (!g_hwndMag)
         return FALSE;
 
-    MAGTRANSFORM m = {};
-    m.v[0][0] = m.v[1][1] = g_magFactor;
-    m.v[2][2] = 1.0f;
-    return MagSetWindowTransform(hwndMag, &m);
+    return ApplyMagnificationTransform();
 }
 
 void CALLBACK UpdateMagWindow(HWND, UINT, UINT_PTR, DWORD)
@@ -757,24 +897,22 @@ void CALLBACK UpdateMagWindow(HWND, UINT, UINT_PTR, DWORD)
     if (!g_overlayVisible)
         return;
 
-    RECT mr = GetMonitorRect(g_config.monitorIndex);
-    int cx = mr.left + (mr.right - mr.left) / 2;
-    int cy = mr.top + (mr.bottom - mr.top) / 2;
+    POINT center = GetMonitorCenter(g_config.monitorIndex);
 
-    int srcWidth = (int)((magWindowRect.right - magWindowRect.left) / g_magFactor);
-    int srcHeight = (int)((magWindowRect.bottom - magWindowRect.top) / g_magFactor);
+    int srcWidth = (int)((g_magWindowRect.right - g_magWindowRect.left) / g_magFactor);
+    int srcHeight = (int)((g_magWindowRect.bottom - g_magWindowRect.top) / g_magFactor);
 
     RECT src;
-    src.left = cx - srcWidth / 2;
-    src.top = cy + g_config.offsetY + (long)g_magFactor - srcHeight / 2;
+    src.left = center.x - srcWidth / 2;
+    src.top = center.y + g_config.offsetY + (long)g_magFactor - srcHeight / 2;
     src.right = src.left + srcWidth;
     src.bottom = src.top + srcHeight;
 
-    MagSetWindowSource(hwndMag, src);
+    MagSetWindowSource(g_hwndMag, src);
     // Skip topmost reassertion while settings window is open — it dismisses combo dropdowns
     if (!g_hwndSettings)
-        SetWindowPos(hwndHost, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
-    InvalidateRect(hwndMag, NULL, TRUE);
+        SetWindowPos(g_hwndHost, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+    InvalidateRect(g_hwndMag, NULL, TRUE);
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -782,7 +920,7 @@ void CALLBACK UpdateMagWindow(HWND, UINT, UINT_PTR, DWORD)
 int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
                      _In_ LPSTR, _In_ int nCmdShow)
 {
-    hInst = hInstance;
+    g_hInstance = hInstance;
     LoadConfig();
     EnumerateMonitors();
 
@@ -791,12 +929,12 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
     if (!SetupMagnifier(hInstance))
         return 0;
 
-    ShowWindow(hwndHost, nCmdShow);
-    UpdateWindow(hwndHost);
-    SetupTray(hwndHost);
+    ShowWindow(g_hwndHost, nCmdShow);
+    UpdateWindow(g_hwndHost);
+    SetupTray(g_hwndHost);
 
-    g_timerId = SetTimer(hwndHost, 0, TimerInterval(), UpdateMagWindow);
-    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInst, NULL);
+    g_timerId = SetTimer(g_hwndHost, 0, TimerInterval(), UpdateMagWindow);
+    HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, g_hInstance, NULL);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
@@ -806,7 +944,22 @@ int APIENTRY WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
     }
 
     UnhookWindowsHookEx(hook);
-    KillTimer(hwndHost, g_timerId);
+    KillTimer(g_hwndHost, g_timerId);
     MagUninitialize();
     return (int)msg.wParam;
 }
+
+#else // !_WIN32
+
+#include <cstdio>
+
+int main()
+{
+    std::fputs(
+        "magnifier: this project is Windows-only at runtime.\n"
+        "This Linux build is a stub so the codebase can compile in cross-platform CI.\n",
+        stderr);
+    return 1;
+}
+
+#endif
