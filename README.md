@@ -2,6 +2,8 @@
 
 A Windows screen magnification overlay built on the Windows Magnification API. Creates a transparent overlay window centered on screen that magnifies the area around the screen center in real time.
 
+![Magnifier overlay and settings window](docs/images/magnifier-screenshot.png)
+
 ## Table of Contents
 
 - [Features](#features)
